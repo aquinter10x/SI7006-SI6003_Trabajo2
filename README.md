@@ -6,6 +6,11 @@
 > Santiago Gomez Rueda
 # 0. Introducción
 La documentacion presentada tiene el proposito de explicar el procedimiento paso paso sobre para implementar un pipeline batch con Apache Spark en AWS y un flujo de Streaming con Amazon Kinesis Data Streams.
+
+Video:
+
+https://www.youtube.com/watch?v=G7aoWtoy91A
+
 # 1. Parte A
 ## 1.1 Datos de Partida
 Estaremos trabajando con los datos del BTS (Bureau of Transportation Statistics) para el Dataset principal. Para el Dataset secundario se utilizaran los datos de OurAirports, los cuales contienen informacion de Aeropuertos tal como:
@@ -911,7 +916,7 @@ La tabla `eventos_invalidos` usa como clave el `sequenceNumber` de Kinesis, que 
 Creamos un bucket para los eventos crudos con **Block all public access** activado, en la misma región. Los eventos se guardarán bajo el prefijo `raw/`.
 
 ```
-<nombre-del-bucket>/
+eventos-crudo/
 └── raw/
     └── AAAA/MM/DD/HH/<sequenceNumber>.jsonl
 ```
@@ -1031,7 +1036,7 @@ Se crea una segunda función con la misma configuración: nombre `raw`, Python 3
 import base64, datetime as dt, boto3
 
 s3 = boto3.client("s3")
-BUCKET = "<nombre-del-bucket>"
+BUCKET = "eventos-crudo"
 
 def lambda_handler(event, context):
     recs = event["Records"]
@@ -1180,7 +1185,7 @@ import boto3, json
 
 R = "us-east-1"
 ddb, s3 = boto3.client("dynamodb", region_name=R), boto3.client("s3", region_name=R)
-BUCKET = "<nombre-del-bucket>"
+BUCKET = "eventos-crudo"
 
 prod = json.load(open("resumen_productor.json"))
 c = ddb.get_item(TableName="contadores", Key={"id": {"S": "total"}})["Item"]
@@ -1241,40 +1246,54 @@ La verificación cruza cuatro fuentes independientes:
 La tabla `resultados_ventanas` contiene una fila por categoría y minuto, con los campos `conteo` y `suma`. El promedio se obtiene como `suma / conteo`.
 
 | Categoría | Ventana | Conteo | Promedio |
-|---|---|---|---|
-| _completar_ | _completar_ | _completar_ | _completar_ |
+|---|---|---:|---:|
+| A | 2026-11-09T21:18 | 68 | 252.69 |
+| B | 2026-11-09T21:18 | 60 | 236.55 |
+| C | 2026-11-09T21:18 | 50 | 212.12 |
+| D | 2026-11-09T21:18 | 53 | 258.71 |
+| A | 2026-11-09T21:19 | 62 | 293.86 |
+| B | 2026-11-09T21:19 | 55 | 254.82 |
+| C | 2026-11-09T21:19 | 64 | 233.71 |
+| D | 2026-11-09T21:19 | 55 | 248.18 |
+| A | 2026-11-09T21:20 | 60 | 254.35 |
+| B | 2026-11-09T21:20 | 59 | 268.76 |
+| C | 2026-11-09T21:20 | 57 | 238.75 |
+| D | 2026-11-09T21:20 | 63 | 238.46 |
+| A | 2026-11-09T21:21 | 66 | 249.82 |
+| B | 2026-11-09T21:21 | 49 | 230.47 |
+| C | 2026-11-09T21:21 | 53 | 246.00 |
+| D | 2026-11-09T21:21 | 70 | 245.60 |
+| A | 2026-11-09T21:22 | 63 | 233.39 |
+| B | 2026-11-09T21:22 | 57 | 262.14 |
+| C | 2026-11-09T21:22 | 65 | 259.56 |
+| D | 2026-11-09T21:22 | 44 | 242.01 |
+| A | 2026-11-09T21:23 | 68 | 250.29 |
+| B | 2026-11-09T21:23 | 56 | 236.08 |
+| C | 2026-11-09T21:23 | 41 | 241.92 |
+| D | 2026-11-09T21:23 | 52 | 272.00 |
+| A | 2026-11-09T21:24 | 2 | 250.15 |
+| B | 2026-11-09T21:24 | 1 | 239.00 |
+| D | 2026-11-09T21:24 | 1 | 492.81 |
 
 #### 2.15.2 Respuesta a la pregunta del proyecto
 
-- Categoría con mayor promedio de valor: _completar_
-- Minuto con más eventos únicos: _completar_
+Categoría con mayor promedio: A (255.46)
+Minuto con más eventos únicos: 2026-11-09T21:20 (239 eventos)
 
-#### 2.15.3 Eventos inválidos
-
-La tabla `eventos_invalidos` guarda cada evento descartado junto con el motivo.
-
-| Motivo | Ejemplo |
-|---|---|
-| campo faltante | _completar_ |
-| categoria desconocida | _completar_ |
-| valor fuera de rango | _completar_ |
-
-#### 2.15.4 Eventos crudos (S3)
-
-Los archivos `.jsonl` quedan organizados bajo `raw/` por año, mes, día y hora. Allí están todos los eventos tal como llegaron: válidos, repetidos e inválidos.
-
-#### 2.15.5 Cuadre de conteos
+#### 2.15.3 Cuadre de conteos
 
 | Concepto | Cantidad |
 |---|---|
-| Publicados (productor) | _completar_ |
-| Guardados crudos en S3 | _completar_ |
-| Únicos procesados | _completar_ |
-| Repetidos descartados | _completar_ |
-| Inválidos descartados | _completar_ |
-| **Únicos + repetidos + inválidos** | _completar_ |
+| Publicados (productor) | 1770 |
+| Guardados crudos en S3 | 1770 |
+| Únicos procesados | 1394 |
+| Repetidos descartados | 196 |
+| Inválidos descartados | 180 |
+| **Únicos + repetidos + inválidos** | 1770 |
 
-Resultado de `verificar.py`: _completar_ (`CUADRA ✅`).
+Resultado de `verificar.py`: CUADRA ✅.
+
+***Cada ejecucion del flujo genera outputs distintos***
 
 ### 2.16 Pausa y repetición de la ejecución
 
@@ -1294,7 +1313,7 @@ Para repetir la demostración se ejecuta `reset.py`, que vacía las cuatro tabla
 import boto3
 
 R = "us-east-1"
-BUCKET = "<nombre-del-bucket>"
+BUCKET = "eventos-crudo"
 CLAVES = {"resultados_ventanas": ["categoria", "ventana"], "eventos_vistos": ["event_id"],
           "eventos_invalidos": ["id"], "contadores": ["id"]}
 
@@ -1322,27 +1341,14 @@ Pasos para repetir la ejecución:
 3. Activar los triggers (**Enable**) y esperar el estado **Enabled**.
 4. Ejecutar el productor, esperar 60 segundos y correr `consulta.py` y `verificar.py`.
 
-### 2.17 Evidencias para el video
-
-El video muestra, en este orden:
-
-1. La consola de **AWS CloudFormation** sin ningún stack en la región de trabajo, para evidenciar que los recursos se crearon manualmente.
-2. El stream de Kinesis.
-3. El productor publicando.
-4. La aplicación que calcula las ventanas (Lambda `procesador` y su trigger).
-5. Los resultados en DynamoDB y la consulta que responde la pregunta.
-6. Los eventos inválidos con su motivo.
-7. Los eventos crudos en S3.
-8. Los conteos de publicados, procesados, repetidos e inválidos.
-
-### 2.18 Limitaciones
+### 2.17 Limitaciones
 
 - **Reintentos de Lambda:** si una función falla a mitad de un lote y Kinesis lo reintenta, los eventos que ya se habían procesado se detectan como repetidos y pueden inflar ese contador. Con reintentos poco frecuentes el efecto es nulo, pero es una limitación del diseño.
 - **Datos sintéticos:** los eventos se generan aleatoriamente, por lo que los resultados solo demuestran el funcionamiento del pipeline.
 - **Ventanas por tiempo del evento:** el diseño asigna cada evento a la ventana de su `timestamp`. No cierra ventanas ni maneja eventos tardíos como lo haría un motor con *watermarks*, que es una de las ventajas de Apache Flink.
 - **Costo del shard:** Kinesis no permite pausar el stream, por lo que se mantiene o se elimina y se recrea según el tiempo entre sesiones.
 
-### 2.19 Conclusiones
+### 2.18 Conclusiones
 
 El flujo implementado integra Kinesis, Lambda, DynamoDB y S3 para procesar eventos de forma continua. Cada evento se valida, se deduplica y se agrega por categoría y minuto, sin perder ni contar dos veces ningún registro.
 
@@ -1351,3 +1357,11 @@ El uso de dos consumidores independientes sobre el mismo stream separa responsab
 La transacción de DynamoDB resuelve la deduplicación de forma sencilla, ya que registrar el identificador y actualizar la ventana ocurren juntos o no ocurren. La verificación final demuestra que el número de eventos publicados es igual a la suma de los únicos procesados, los repetidos descartados y los inválidos descartados.
 
 Finalmente, la elección de Lambda frente a Flink muestra un compromiso habitual: Lambda es más simple y económica para volúmenes pequeños, mientras que Flink ofrece ventanas con *watermarks* y estado administrado, útiles cuando el volumen y la complejidad de la lógica temporal crecen.
+
+## 2.19 Clausula de Uso Etico de Inteligencia Artificial.
+Se utilizo IA generativa para el desarrollo del los codigos de python y los codigos de las lambdas. 
+
+El resumen de los resultados generales y las conclusiones fue generado por IA. Los resultados generales son recopilaciones de la arquitectura propuesta por el equipo.
+
+Esta seccion de la documentacion PARTE B fue generada con asistencia de IA.
+La produccion del video **NO** fue generada por IA.
