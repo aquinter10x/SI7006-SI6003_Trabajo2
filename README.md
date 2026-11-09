@@ -796,3 +796,558 @@ El formato Json para la descripcion de la configuracion de AWS Step Functions fu
 
 Esta seccion **NO** fue generada por IA.
 La produccion del video **NO** fue generada por IA.
+
+## 2. Parte B
+
+### 2.1 Objetivo y contexto
+
+La Parte B construye un flujo de streaming con Amazon Kinesis Data Streams. Mientras que la Parte A procesa en lote datos históricos, esta parte procesa eventos de forma continua: un productor publica eventos durante varios minutos y una aplicación calcula, por ventanas de un minuto, el conteo de eventos y el promedio de un campo, por categoría.
+
+El flujo debe manejar dos situaciones propias de los datos reales en streaming:
+
+- **Eventos repetidos:** el mismo evento llega más de una vez y no debe contarse dos veces.
+- **Eventos inválidos:** eventos con un campo faltante o con un valor fuera de rango, que deben apartarse junto con el motivo del descarte.
+
+La pregunta que responde esta parte es:
+
+> ¿Qué categoría tuvo el mayor promedio de valor y en qué minuto hubo más eventos únicos?
+
+> **Nota:** los eventos que publica el productor son **sintéticos**. Se generan aleatoriamente para demostrar el funcionamiento del pipeline, por lo que los resultados no describen una situación real.
+
+### 2.2 Arquitectura
+
+```
+                         ┌─► Lambda procesador ─┬─► DynamoDB: resultados_ventanas
+Productor ──► Kinesis ───┤   (valida, deduplica,├─► DynamoDB: eventos_invalidos
+(Python)      Data       │    agrega por minuto)├─► DynamoDB: eventos_vistos
+              Stream     │                      └─► DynamoDB: contadores
+                         │
+                         └─► Lambda raw ──────────► S3 (eventos tal como llegan)
+```
+
+| Componente | Función |
+|---|---|
+| **Kinesis Data Streams** | Buzón ordenado y duradero donde el productor publica y de donde leen los consumidores. Un *shard* ofrece 1 MB/s de escritura y 2 MB/s de lectura. |
+| **Lambda `procesador`** | Primer consumidor. Valida cada evento, detecta repetidos y calcula las ventanas. |
+| **Lambda `raw`** | Segundo consumidor del mismo stream. Guarda todos los eventos sin filtrar. |
+| **DynamoDB** | Almacena los resultados por ventana, los identificadores ya vistos, los eventos inválidos con su motivo y los contadores de control. |
+| **S3** | Almacena los eventos crudos en formato JSON Lines. |
+
+Cada *trigger* de Kinesis en una Lambda es un consumidor independiente. Por eso `procesador` y `raw` leen el stream completo de forma separada.
+
+Para la aplicación de ventanas se eligió **AWS Lambda** en lugar de Amazon Managed Service for Apache Flink. El enunciado permite ambas opciones, y Lambda resulta más económica y simple de depurar dentro del presupuesto del Learner Lab.
+
+### 2.3 Diseño del flujo
+
+**Esquema del evento**
+
+```json
+{
+  "event_id": "uuid",
+  "categoria": "A",
+  "valor": 123.45,
+  "timestamp": "2026-11-09T15:04:12.345Z"
+}
+```
+
+| Campo | Significado |
+|---|---|
+| `event_id` | Identificador único del evento. Se usa para reconocer repetidos. |
+| `categoria` | Categoría del evento (A, B, C o D). Es la clave de la agregación. |
+| `valor` | Campo numérico del que se calcula el promedio. |
+| `timestamp` | Momento del evento, en UTC. |
+
+**Reglas de validez.** Un evento es válido si cumple todo lo siguiente:
+
+- Contiene los cuatro campos.
+- La categoría es A, B, C o D.
+- El valor es numérico y está entre 0 y 1000.
+
+Los eventos que no cumplen se apartan con el motivo del descarte: `campo faltante`, `categoria desconocida`, `valor fuera de rango`, `valor no numerico` o `JSON malformado`.
+
+**Decisiones de diseño**
+
+| Requisito | Solución |
+|---|---|
+| Reconocer repetidos | Un evento es repetido si su `event_id` ya existe en la tabla `eventos_vistos`. |
+| Ventana de un minuto | Se trunca el `timestamp` del evento al minuto (`2026-11-09T15:04`). Corresponde a una ventana *tumbling* sin solapamiento, basada en el tiempo del evento. |
+| Conteo y promedio | Por cada evento único se suma 1 al conteo y el valor a la suma. El promedio es `suma / conteo`. |
+| No contar dos veces | Una transacción de DynamoDB inserta el `event_id` solo si no existía, actualiza la ventana y actualiza el contador. Si el identificador ya existía, la transacción se cancela y nada se cuenta. |
+
+### 2.4 Preparación del entorno
+
+1. Iniciar el Learner Lab con **Start Lab** y esperar el indicador verde.
+2. Abrir la consola de AWS y cambiar la región a **N. Virginia (us-east-1)**. Todos los recursos deben estar en la misma región.
+3. Para mantener la consistencia de roles se usa **LabRole** en todas las funciones, ya que AWS Academy no permite crear roles.
+
+### 2.5 Creación del stream de Kinesis
+
+1. En el buscador de AWS escribimos **Kinesis** y entramos a **Kinesis Data Streams**.
+2. Pulsamos **Create data stream** con la siguiente configuración:
+   - Nombre: `eventos-stream`
+   - Capacity mode: **Provisioned**
+   - Provisioned shards: **1**
+3. Pulsamos **Create data stream** y esperamos el estado **Active**.
+
+Un shard es suficiente para unos 5 eventos por segundo. El modo provisionado con un solo shard es la opción más económica para este volumen.
+
+### 2.6 Creación de las tablas de DynamoDB
+
+En **DynamoDB → Create table** creamos cuatro tablas con claves de tipo String y capacidad **On-demand**:
+
+| Tabla | Partition key | Sort key | Uso |
+|---|---|---|---|
+| `resultados_ventanas` | `categoria` | `ventana` | Una fila por categoría y minuto |
+| `eventos_vistos` | `event_id` | (ninguna) | Memoria de identificadores para detectar repetidos |
+| `eventos_invalidos` | `id` | (ninguna) | Eventos descartados con su motivo |
+| `contadores` | `id` | (ninguna) | Contadores de únicos, repetidos e inválidos |
+
+En `eventos_vistos` activamos el **TTL**: en la pestaña **Additional settings** pulsamos **Turn on** en *Time to Live* y escribimos el atributo `ttl`. Así los identificadores antiguos se eliminan solos y la tabla no crece sin límite.
+
+La tabla `eventos_invalidos` usa como clave el `sequenceNumber` de Kinesis, que es único por registro. De esta forma un reintento de Lambda no duplica el mismo evento inválido.
+
+### 2.7 Creación del bucket de S3
+
+Creamos un bucket para los eventos crudos con **Block all public access** activado, en la misma región. Los eventos se guardarán bajo el prefijo `raw/`.
+
+```
+<nombre-del-bucket>/
+└── raw/
+    └── AAAA/MM/DD/HH/<sequenceNumber>.jsonl
+```
+
+### 2.8 Lambda `procesador`
+
+En **Lambda → Create function** definimos:
+
+- Function name: `procesador`
+- Runtime: Python 3.12
+- Execution role: **LabRole** (rol existente)
+- Timeout: 1 minuto (en *Configuration → General configuration*)
+
+El handler queda con el valor por defecto, `lambda_function.lambda_handler`. En el editor de código pegamos lo siguiente y pulsamos **Deploy**:
+
+```python
+import base64, json, time
+from decimal import Decimal
+import boto3
+
+ddb = boto3.client("dynamodb")
+T_RES, T_VISTOS = "resultados_ventanas", "eventos_vistos"
+T_INV, T_CONT = "eventos_invalidos", "contadores"
+
+CAMPOS = ["event_id", "categoria", "valor", "timestamp"]
+CATEGORIAS = {"A", "B", "C", "D"}
+MIN_V, MAX_V = 0, 1000
+
+
+def validar(e):
+    """Devuelve el motivo de descarte, o None si el evento es válido."""
+    if not isinstance(e, dict):
+        return "no es un objeto JSON"
+    for c in CAMPOS:
+        if e.get(c) in (None, ""):
+            return f"campo faltante: {c}"
+    if e["categoria"] not in CATEGORIAS:
+        return f"categoria desconocida: {e['categoria']}"
+    try:
+        v = float(e["valor"])
+    except (TypeError, ValueError):
+        return "valor no numerico"
+    if not (MIN_V <= v <= MAX_V):
+        return f"valor fuera de rango [{MIN_V},{MAX_V}]: {v}"
+    return None
+
+
+def contador(campo):
+    return {"Update": {
+        "TableName": T_CONT, "Key": {"id": {"S": "total"}},
+        "UpdateExpression": f"ADD {campo} :uno",
+        "ExpressionAttributeValues": {":uno": {"N": "1"}}}}
+
+
+def lambda_handler(event, context):
+    for rec in event["Records"]:
+        seq = rec["kinesis"]["sequenceNumber"]
+        crudo = base64.b64decode(rec["kinesis"]["data"]).decode("utf-8", "replace")
+
+        # 1) Parsear y validar
+        try:
+            e = json.loads(crudo)
+            motivo = validar(e)
+        except json.JSONDecodeError:
+            e, motivo = None, "JSON malformado"
+
+        # 2) Inválido: guardarlo con su motivo y sumar al contador (atómico)
+        if motivo:
+            try:
+                ddb.transact_write_items(TransactItems=[
+                    {"Put": {"TableName": T_INV,
+                             "Item": {"id": {"S": seq}, "motivo": {"S": motivo},
+                                      "payload": {"S": crudo}},
+                             "ConditionExpression": "attribute_not_exists(id)"}},
+                    contador("invalidos")])
+            except ddb.exceptions.TransactionCanceledException:
+                pass  # ya se había guardado (reintento): no contar de nuevo
+            continue
+
+        # 3) Válido: deduplicación, ventana y contador en UNA transacción
+        ventana = e["timestamp"][:16]            # '2026-11-09T15:04' = minuto
+        valor = str(Decimal(str(e["valor"])))
+        ttl = int(time.time()) + 24 * 3600
+        try:
+            ddb.transact_write_items(TransactItems=[
+                {"Put": {"TableName": T_VISTOS,
+                         "Item": {"event_id": {"S": e["event_id"]}, "ttl": {"N": str(ttl)}},
+                         "ConditionExpression": "attribute_not_exists(event_id)"}},
+                {"Update": {"TableName": T_RES,
+                            "Key": {"categoria": {"S": e["categoria"]}, "ventana": {"S": ventana}},
+                            "UpdateExpression": "ADD conteo :uno, suma :v",
+                            "ExpressionAttributeValues": {":uno": {"N": "1"}, ":v": {"N": valor}}}},
+                contador("unicos")])
+        except ddb.exceptions.TransactionCanceledException as ex:
+            razones = [r.get("Code") for r in ex.response.get("CancellationReasons", [])]
+            if "ConditionalCheckFailed" in razones:   # el event_id ya existía = repetido
+                ddb.update_item(TableName=T_CONT, Key={"id": {"S": "total"}},
+                                UpdateExpression="ADD repetidos :uno",
+                                ExpressionAttributeValues={":uno": {"N": "1"}})
+            else:
+                raise   # error real: Lambda reintentará el lote
+```
+
+**Cómo funciona:**
+
+- Kinesis entrega los datos codificados en base64, por lo que primero se decodifican.
+- Si el evento es inválido, se guarda con su `motivo` y se incrementa el contador `invalidos`.
+- Si es válido, una transacción de DynamoDB ejecuta tres operaciones de forma atómica: registrar el `event_id`, actualizar la ventana y sumar al contador `unicos`.
+- Si el `event_id` ya existía, la condición falla, la transacción se cancela y el evento no entra a la ventana. Solo se incrementa `repetidos`.
+- La instrucción `ADD` de DynamoDB es un incremento atómico, por lo que no hay problemas con eventos concurrentes.
+
+### 2.9 Lambda `raw`
+
+Se crea una segunda función con la misma configuración: nombre `raw`, Python 3.12, **LabRole** y timeout de 1 minuto. Se reemplaza el valor de `BUCKET` por el nombre del bucket:
+
+```python
+import base64, datetime as dt, boto3
+
+s3 = boto3.client("s3")
+BUCKET = "<nombre-del-bucket>"
+
+def lambda_handler(event, context):
+    recs = event["Records"]
+    lineas = [base64.b64decode(r["kinesis"]["data"]).decode("utf-8", "replace") for r in recs]
+    primero = recs[0]["kinesis"]
+    llegada = dt.datetime.fromtimestamp(primero["approximateArrivalTimestamp"], dt.timezone.utc)
+    key = f"raw/{llegada:%Y/%m/%d/%H}/{primero['sequenceNumber']}.jsonl"
+    s3.put_object(Bucket=BUCKET, Key=key, Body="\n".join(lineas).encode("utf-8"))
+```
+
+**Cómo funciona:** cada lote se escribe tal como llegó, sin validar ni filtrar, en formato JSON Lines (un evento por línea). El nombre del archivo usa el `sequenceNumber` del primer registro, que es determinista. Si Lambda reintenta un lote, sobrescribe el mismo objeto en lugar de crear un duplicado.
+
+### 2.10 Conexión de las Lambdas con el stream
+
+En cada una de las dos funciones se agrega un trigger con **Add trigger → Kinesis**:
+
+| Parámetro | Valor |
+|---|---|
+| Kinesis stream | `eventos-stream` |
+| Consumer | (vacío) |
+| Batch size | 100 |
+| Batch window | 5 segundos |
+| Starting position | **Trim horizon** |
+
+Cada trigger es un *event source mapping*, un proceso gestionado que lee el stream y llama a la función con lotes de registros. Como cada Lambda tiene el suyo, ambas reciben todos los eventos de manera independiente, lo que cumple el requisito del segundo consumidor.
+
+- **Batch size y window:** Lambda junta hasta 100 eventos o espera 5 segundos antes de invocar la función.
+- **Trim horizon:** la lectura comienza en el evento más antiguo disponible, para no perder ninguno de los ya publicados.
+- **Sin consumidor dedicado:** ambos triggers comparten el ancho de banda de lectura del shard, lo cual es suficiente para este volumen.
+
+### 2.11 El productor
+
+Los scripts se ejecutan desde **AWS CloudShell**, que usa las credenciales del Learner Lab y ya incluye Python y boto3. El productor publica durante **6 minutos** (el mínimo exigido es 5) a unos 5 eventos por segundo.
+
+```python
+import boto3, json, random, time, uuid, datetime as dt
+
+STREAM = "eventos-stream"
+DURACION_S = 6 * 60          # 6 minutos (>5 exigidos)
+EVENTOS_POR_SEG = 5
+kin = boto3.client("kinesis", region_name="us-east-1")
+
+res = {"publicados": 0, "validos_unicos": 0, "duplicados": 0, "invalidos": 0}
+recientes = []   # válidos ya enviados, para repetirlos
+
+def evento_valido():
+    return {"event_id": str(uuid.uuid4()),
+            "categoria": random.choice("ABCD"),
+            "valor": round(random.uniform(1, 500), 2),
+            "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"}
+
+def evento_invalido():
+    e = evento_valido()
+    tipo = random.choice(["sin_campo", "fuera_rango", "categoria_mala"])
+    if tipo == "sin_campo":
+        del e[random.choice(["event_id", "categoria", "valor", "timestamp"])]
+    elif tipo == "fuera_rango":
+        e["valor"] = random.choice([-50, 5000])
+    else:
+        e["categoria"] = "Z"
+    return e
+
+def enviar(lote):
+    """lote: lista de (tipo, evento). Reintenta los registros que Kinesis rechace."""
+    pendientes = lote
+    while pendientes:
+        r = kin.put_records(StreamName=STREAM, Records=[
+            {"Data": json.dumps(ev).encode(), "PartitionKey": str(uuid.uuid4())}
+            for _, ev in pendientes])
+        fallidos = []
+        for item, resp in zip(pendientes, r["Records"]):
+            if "ErrorCode" in resp:
+                fallidos.append(item)
+            else:
+                res["publicados"] += 1
+                res[item[0]] += 1
+        pendientes = fallidos
+        if pendientes:
+            time.sleep(0.5)
+
+inicio = time.time()
+while time.time() - inicio < DURACION_S:
+    lote = []
+    for _ in range(EVENTOS_POR_SEG):
+        x = random.random()
+        if x < 0.10 and recientes:                       # ~10% repetidos
+            lote.append(("duplicados", random.choice(recientes)))
+        elif x < 0.20:                                   # ~10% inválidos
+            lote.append(("invalidos", evento_invalido()))
+        else:                                            # ~80% válidos únicos
+            e = evento_valido()
+            recientes = (recientes + [e])[-200:]
+            lote.append(("validos_unicos", e))
+    enviar(lote)
+    print(res, end="\r")
+    time.sleep(1)
+
+json.dump(res, open("resumen_productor.json", "w"), indent=2)
+print("\nListo:", res)
+```
+
+**Puntos clave:**
+
+- Los **repetidos** son una copia exacta de un evento válido enviado antes, con el mismo `event_id`. Representan cerca del 10 % de los eventos.
+- Los **inválidos** representan cerca del 10 % y pueden tener un campo faltante, una categoría inexistente (`Z`) o un valor fuera del rango definido (-50 o 5000).
+- `PutRecords` puede aceptar unos registros y rechazar otros. Por eso el productor revisa cada respuesta, reintenta los rechazados y solo cuenta como publicado lo que Kinesis aceptó.
+- El productor lleva su propia contabilidad en `resumen_productor.json`, que es la referencia contra la cual se verifican los conteos al final.
+- La `PartitionKey` aleatoria reparte los registros entre shards. Con un solo shard no tiene efecto práctico.
+
+### 2.12 Consulta de resultados
+
+El siguiente script lee la tabla `resultados_ventanas` y responde la pregunta del proyecto:
+
+```python
+import boto3
+from collections import defaultdict
+
+t = boto3.resource("dynamodb", region_name="us-east-1").Table("resultados_ventanas")
+items, resp = [], t.scan()
+items += resp["Items"]
+while "LastEvaluatedKey" in resp:
+    resp = t.scan(ExclusiveStartKey=resp["LastEvaluatedKey"]); items += resp["Items"]
+
+print(f"{'categoria':<10}{'ventana':<18}{'conteo':>7}{'promedio':>10}")
+for i in sorted(items, key=lambda x: (x["ventana"], x["categoria"])):
+    print(f"{i['categoria']:<10}{i['ventana']:<18}{int(i['conteo']):>7}{float(i['suma'])/int(i['conteo']):>10.2f}")
+
+tot = defaultdict(lambda: [0, 0.0]); por_min = defaultdict(int)
+for i in items:
+    tot[i["categoria"]][0] += int(i["conteo"]); tot[i["categoria"]][1] += float(i["suma"])
+    por_min[i["ventana"]] += int(i["conteo"])
+mejor = max(tot, key=lambda c: tot[c][1] / tot[c][0])
+print(f"\nCategoría con mayor promedio: {mejor} ({tot[mejor][1]/tot[mejor][0]:.2f})")
+m = max(por_min, key=por_min.get)
+print(f"Minuto con más eventos únicos: {m} ({por_min[m]} eventos)")
+```
+
+La salida muestra el detalle por ventana, y al final las dos respuestas: la categoría con el mayor promedio de valor y el minuto con más eventos únicos.
+
+### 2.13 Verificación de los conteos
+
+El siguiente script demuestra que **publicados = únicos + repetidos + inválidos**, y que ese total coincide con los eventos guardados en S3:
+
+```python
+import boto3, json
+
+R = "us-east-1"
+ddb, s3 = boto3.client("dynamodb", region_name=R), boto3.client("s3", region_name=R)
+BUCKET = "<nombre-del-bucket>"
+
+prod = json.load(open("resumen_productor.json"))
+c = ddb.get_item(TableName="contadores", Key={"id": {"S": "total"}})["Item"]
+g = lambda k: int(c.get(k, {"N": "0"})["N"])
+unicos, repetidos, invalidos = g("unicos"), g("repetidos"), g("invalidos")
+
+# Líneas guardadas en S3 (eventos crudos)
+raw = 0
+for pag in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix="raw/"):
+    for o in pag.get("Contents", []):
+        cuerpo = s3.get_object(Bucket=BUCKET, Key=o["Key"])["Body"].read().decode()
+        raw += len([l for l in cuerpo.split("\n") if l.strip()])
+
+# Filas en la tabla de inválidos y suma de conteos de las ventanas
+n_inv = ddb.scan(TableName="eventos_invalidos", Select="COUNT")["Count"]
+suma_ventanas, kw = 0, {}
+while True:
+    r = ddb.scan(TableName="resultados_ventanas", **kw)
+    suma_ventanas += sum(int(i["conteo"]["N"]) for i in r["Items"])
+    if "LastEvaluatedKey" not in r: break
+    kw = {"ExclusiveStartKey": r["LastEvaluatedKey"]}
+
+print(f"Publicados (productor):          {prod['publicados']}")
+print(f"Guardados crudos en S3:          {raw}")
+print(f"Únicos procesados:               {unicos}")
+print(f"Repetidos descartados:           {repetidos}")
+print(f"Inválidos descartados:           {invalidos}")
+print(f"Suma únicos+repetidos+inválidos: {unicos+repetidos+invalidos}")
+print(f"Suma de 'conteo' en ventanas:    {suma_ventanas}   | filas en eventos_invalidos: {n_inv}")
+print("\nCUADRA ✅" if prod["publicados"] == raw == unicos+repetidos+invalidos and
+      unicos == prod["validos_unicos"] == suma_ventanas and
+      repetidos == prod["duplicados"] and invalidos == prod["invalidos"] == n_inv
+      else "\nNO CUADRA ❌ (espera unos segundos y reintenta, o revisa logs)")
+```
+
+La verificación cruza cuatro fuentes independientes:
+
+1. **El productor:** cuántos eventos aceptó Kinesis y de qué tipo eran.
+2. **DynamoDB, tabla `contadores`:** cuántos eventos únicos, repetidos e inválidos procesó la Lambda.
+3. **DynamoDB, tablas de resultados e inválidos:** que la suma de los conteos de las ventanas y el número de filas inválidas coincidan con los contadores.
+4. **S3:** que el total de eventos crudos sea igual al total publicado.
+
+### 2.14 Ejecución
+
+1. Dejar los datos en cero con `reset.py` (ver sección 2.16).
+2. Verificar que los dos triggers estén en **Enabled**.
+3. Ejecutar el productor desde CloudShell con `python3 productor.py`. Dura 6 minutos y la pestaña no debe cerrarse.
+4. Esperar unos 60 segundos a que los consumidores alcancen el final del stream.
+5. Ejecutar `python3 consulta.py` y luego `python3 verificar.py`.
+6. Revisar las tablas y el bucket en la consola para documentar los resultados.
+
+### 2.15 Resultados
+
+> Los valores de las tablas deben completarse con la salida de la ejecución final.
+
+#### 2.15.1 Resultados por ventana (DynamoDB)
+
+La tabla `resultados_ventanas` contiene una fila por categoría y minuto, con los campos `conteo` y `suma`. El promedio se obtiene como `suma / conteo`.
+
+| Categoría | Ventana | Conteo | Promedio |
+|---|---|---|---|
+| _completar_ | _completar_ | _completar_ | _completar_ |
+
+#### 2.15.2 Respuesta a la pregunta del proyecto
+
+- Categoría con mayor promedio de valor: _completar_
+- Minuto con más eventos únicos: _completar_
+
+#### 2.15.3 Eventos inválidos
+
+La tabla `eventos_invalidos` guarda cada evento descartado junto con el motivo.
+
+| Motivo | Ejemplo |
+|---|---|
+| campo faltante | _completar_ |
+| categoria desconocida | _completar_ |
+| valor fuera de rango | _completar_ |
+
+#### 2.15.4 Eventos crudos (S3)
+
+Los archivos `.jsonl` quedan organizados bajo `raw/` por año, mes, día y hora. Allí están todos los eventos tal como llegaron: válidos, repetidos e inválidos.
+
+#### 2.15.5 Cuadre de conteos
+
+| Concepto | Cantidad |
+|---|---|
+| Publicados (productor) | _completar_ |
+| Guardados crudos en S3 | _completar_ |
+| Únicos procesados | _completar_ |
+| Repetidos descartados | _completar_ |
+| Inválidos descartados | _completar_ |
+| **Únicos + repetidos + inválidos** | _completar_ |
+
+Resultado de `verificar.py`: _completar_ (`CUADRA ✅`).
+
+### 2.16 Pausa y repetición de la ejecución
+
+El presupuesto del Learner Lab es limitado, por lo que al terminar cada sesión se pausan los componentes que generan costo.
+
+| Recurso | Acción | Costo en reposo |
+|---|---|---|
+| Triggers de Lambda | **Disable** en cada trigger, sin borrarlos | Ninguno |
+| Funciones Lambda | Se dejan creadas | Ninguno, solo cobran al ejecutarse |
+| DynamoDB (on-demand) | Se dejan creadas | Prácticamente ninguno |
+| S3 | Se deja el bucket | Prácticamente ninguno |
+| Kinesis | No puede pausarse: el shard cobra por hora | Bajo, pero continuo |
+
+Para repetir la demostración se ejecuta `reset.py`, que vacía las cuatro tablas y el prefijo `raw/`. Esto es necesario porque `verificar.py` compara contra el `resumen_productor.json` de la última ejecución. Si los datos anteriores siguen en las tablas, los conteos no cuadrarían.
+
+```python
+import boto3
+
+R = "us-east-1"
+BUCKET = "<nombre-del-bucket>"
+CLAVES = {"resultados_ventanas": ["categoria", "ventana"], "eventos_vistos": ["event_id"],
+          "eventos_invalidos": ["id"], "contadores": ["id"]}
+
+dd = boto3.resource("dynamodb", region_name=R)
+for nombre, claves in CLAVES.items():
+    tabla, n, kw = dd.Table(nombre), 0, {}
+    while True:
+        r = tabla.scan(ProjectionExpression=", ".join("#" + k for k in claves),
+                       ExpressionAttributeNames={"#" + k: k for k in claves}, **kw)
+        with tabla.batch_writer() as bw:
+            for it in r["Items"]:
+                bw.delete_item(Key=it); n += 1
+        if "LastEvaluatedKey" not in r: break
+        kw = {"ExclusiveStartKey": r["LastEvaluatedKey"]}
+    print(f"{nombre}: {n} filas borradas")
+
+boto3.resource("s3", region_name=R).Bucket(BUCKET).objects.filter(Prefix="raw/").delete()
+print("S3 raw/ vaciado")
+```
+
+Pasos para repetir la ejecución:
+
+1. Iniciar el Learner Lab y confirmar la región us-east-1.
+2. Ejecutar `python3 reset.py`.
+3. Activar los triggers (**Enable**) y esperar el estado **Enabled**.
+4. Ejecutar el productor, esperar 60 segundos y correr `consulta.py` y `verificar.py`.
+
+### 2.17 Evidencias para el video
+
+El video muestra, en este orden:
+
+1. La consola de **AWS CloudFormation** sin ningún stack en la región de trabajo, para evidenciar que los recursos se crearon manualmente.
+2. El stream de Kinesis.
+3. El productor publicando.
+4. La aplicación que calcula las ventanas (Lambda `procesador` y su trigger).
+5. Los resultados en DynamoDB y la consulta que responde la pregunta.
+6. Los eventos inválidos con su motivo.
+7. Los eventos crudos en S3.
+8. Los conteos de publicados, procesados, repetidos e inválidos.
+
+### 2.18 Limitaciones
+
+- **Reintentos de Lambda:** si una función falla a mitad de un lote y Kinesis lo reintenta, los eventos que ya se habían procesado se detectan como repetidos y pueden inflar ese contador. Con reintentos poco frecuentes el efecto es nulo, pero es una limitación del diseño.
+- **Datos sintéticos:** los eventos se generan aleatoriamente, por lo que los resultados solo demuestran el funcionamiento del pipeline.
+- **Ventanas por tiempo del evento:** el diseño asigna cada evento a la ventana de su `timestamp`. No cierra ventanas ni maneja eventos tardíos como lo haría un motor con *watermarks*, que es una de las ventajas de Apache Flink.
+- **Costo del shard:** Kinesis no permite pausar el stream, por lo que se mantiene o se elimina y se recrea según el tiempo entre sesiones.
+
+### 2.19 Conclusiones
+
+El flujo implementado integra Kinesis, Lambda, DynamoDB y S3 para procesar eventos de forma continua. Cada evento se valida, se deduplica y se agrega por categoría y minuto, sin perder ni contar dos veces ningún registro.
+
+El uso de dos consumidores independientes sobre el mismo stream separa responsabilidades: uno calcula y publica resultados, y el otro conserva la copia íntegra de los eventos para auditoría y reprocesamiento.
+
+La transacción de DynamoDB resuelve la deduplicación de forma sencilla, ya que registrar el identificador y actualizar la ventana ocurren juntos o no ocurren. La verificación final demuestra que el número de eventos publicados es igual a la suma de los únicos procesados, los repetidos descartados y los inválidos descartados.
+
+Finalmente, la elección de Lambda frente a Flink muestra un compromiso habitual: Lambda es más simple y económica para volúmenes pequeños, mientras que Flink ofrece ventanas con *watermarks* y estado administrado, útiles cuando el volumen y la complejidad de la lógica temporal crecen.
